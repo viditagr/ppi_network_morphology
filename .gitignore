@@ -7,8 +7,11 @@ __pycache__/
 *.pkl
 # Run Artifacts
 dino_artifacts/
-schedulers_comparision.ipynb
-
+schedulers_comparision.ipynb\
+opencell_data/
+papers/
+opencell_features/
+benchmarks/OpenCell/figures/
 
 
 # C extensions

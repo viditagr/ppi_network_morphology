@@ -394,14 +394,29 @@ class DINOv3(Model):
         device,
         repo_dir: str = "/scr/vidit/dinov3",
         weights: str = "/scr/vidit/dinov3_vits16_pretrain_lvd1689m-08c60483.pth",
+        channel_mode: str = "per_channel",
     ):
+        """channel_mode:
+        "per_channel" (default, used by the other benchmarks): every channel is copied to RGB and
+            embedded separately; the CLS tokens are concatenated (384 * C dims).
+        "nuc_rgb": expects exactly 2 channels ordered [nucleus, protein] and builds one composite
+            RGB image R = nucleus, G = B = protein, giving a single 384-d CLS token. Each channel is
+            min-max scaled per image on its own, so a dim protein is not suppressed by a bright nucleus.
+        """
         super().__init__()
+        if channel_mode not in ("per_channel", "nuc_rgb"):
+            raise ValueError(f"unknown DINOv3 channel_mode {channel_mode!r}")
+        self.channel_mode = channel_mode
 
         self.repo_dir = repo_dir
         self.weights = weights
-        self.model = torch.hub.load(
-            self.repo_dir, "dinov3_vits16", source="local", weights=self.weights
-        )
+        # Import the backbone builder directly: torch.hub.load runs the repo's hubconf.py, which also
+        # imports the segmentation/detection heads and needs extra packages (e.g. torchmetrics).
+        if self.repo_dir not in sys.path:
+            sys.path.insert(0, self.repo_dir)
+        from dinov3.hub.backbones import dinov3_vits16
+
+        self.model = dinov3_vits16(weights=self.weights)
         self.model.eval()
         self.model = self.model.to(device)  # Move model to GPU
         self.device = device
@@ -441,7 +456,21 @@ class DINOv3(Model):
         patch_height, patch_width = patch_size
         return patch_height, patch_width
 
+    def _nuc_rgb(self, patches: torch.Tensor):
+        """[B, 2, H, W] ordered (nucleus, protein) -> [B, 3, H, W] = (nucleus, protein, protein)."""
+        if patches.shape[1] != 2:
+            raise ValueError(f"nuc_rgb mode expects 2 channels (nucleus, protein), got {patches.shape[1]}")
+        patches = patches.to(torch.float32)
+        lo = torch.amin(patches, dim=(2, 3), keepdim=True)
+        hi = torch.amax(patches, dim=(2, 3), keepdim=True)
+        patches = (patches - lo) / (hi - lo + 1e-6)
+        return torch.cat([patches[:, 0:1], patches[:, 1:2], patches[:, 1:2]], dim=1)
+
     def __call__(self, patches: torch.Tensor):
+        if self.channel_mode == "nuc_rgb":
+            with torch.no_grad():
+                rgb = self._normalize(self._nuc_rgb(patches).to(self.device))
+                return self.model.forward_features(rgb)["x_norm_clstoken"].detach().cpu().numpy()
         with torch.no_grad():
             patches = self._scale(patches)
             patches = patches.to(self.device)  # Move input to GPU
@@ -1041,7 +1070,11 @@ def get_model(
     model_path: str = None,
     model_size: str = "small",
     model_type: str = "conc",
+    config_path: str = None,
+    dinov3_mode: str = "per_channel",
 ):
+    """config_path: SubCell model yaml (the matching .pth must sit next to it); None keeps the
+    previous default. dinov3_mode: see DINOv3.__init__ ("per_channel" or "nuc_rgb")."""
     if model_name == "mae":
         model = MAEModel(device=device, weights_path=model_path, model_size=model_size)
     elif model_name == "vit":
@@ -1051,11 +1084,12 @@ def get_model(
     elif model_name == "openphenom":
         model = OpenPhenom(device=device, mode=model_type)
     elif model_name == "dinov3":
-        model = DINOv3(device=device)
+        model = DINOv3(device=device, channel_mode=dinov3_mode)
     elif model_name == "subcell":
         model = SubCell_Neuron_Feat(
             device=device,
-            config_path="/mnt/cephfs/mir/jcaicedo/morphem/dataset/models/subcell_models/DNA-Protein_ViT-ProtS-Pool.yaml",
+            config_path=config_path
+            or "/mnt/cephfs/mir/jcaicedo/morphem/dataset/models/subcell_models/DNA-Protein_ViT-ProtS-Pool.yaml",
         )
     elif model_name == "channelvit":
         model = ChannelVIT(device=device, model_path=model_path, model_size=model_size)
